@@ -1,108 +1,177 @@
-# 🚀 Recon-to-Report Pipeline (`recon.sh`)
+# recon.sh — Automated Recon Pipeline for Lab Targets
 
-A modular, resilient Bash-based reconnaissance pipeline designed to automate initial host discovery, service enumeration, vulnerability assessment, and web content discovery in **Lab/CTF environments**.
+A single-file Bash pipeline that chains the recon phases a pentest methodology
+(e.g. **PTES** — Pre-engagement, Intelligence Gathering, Threat Modeling,
+Vulnerability Analysis) typically runs by hand: full TCP scan → service/version
+detection → NSE vuln scripts → UDP scan → web content fuzzing → web
+screenshotting → a Markdown executive summary.
 
-Built around Unix pipeline philosophy, `recon.sh` minimizes manual friction by chaining enumeration tools into an automated execution flow with HTML/Log reporting.
-
----
-
-## 📐 Architecture & Key Principles
-
-### 1. State-Driven Pipeline Chaining
-Output from early stages dynamically filters parameters for subsequent phases. For example, Phase 1 full-port scan extracts open ports, which are directly fed into Phase 2 service detection to eliminate redundant probe traffic.
-
-### 2. Operational Resilience & Signal Trapping
-Handles interrupts gracefully using POSIX `trap` commands (`SIGINT`/`SIGTERM`) to clean up spawned sub-processes (`nmap`, `ffuf`) and avoid leaving orphan zombie processes in system memory.
-
-### 3. Configurable Environment Variables
-Key performance parameters (scan rates, thread counts, timeout limits) are decoupled from the core logic using standard Environment Variables with sane fallback defaults.
+Built for use in an isolated home lab (Kali VM + local target VMs) while
+studying penetration testing.
 
 ---
 
-## 🎯 Alignment with PTES Methodology
+## ⚠️ Authorization & Scope — Read This First
 
-The execution sequence directly maps to the **Penetration Testing Execution Standard (PTES)**:
+**This tool sends active scan traffic (port scans, vuln scripts, directory
+fuzzing) to the target.** Running it against a system you don't own or don't
+have explicit written permission to test is unauthorized access in most
+jurisdictions, regardless of intent.
 
-```text
-[Target IP]
-    │
-    ├── ➔ Phase 1: Full TCP Scanning (1-65535)    [PTES: Active Reconnaissance]
-    │        └─ Extracted Open Ports
-    │
-    ├── ➔ Phase 2: Service & Version Detection   [PTES: Service Identification]
-    │        └─ Dynamic HTTP/HTTPS Probing
-    │
-    ├── ➔ Phase 3: Vulnerability Script Scan     [PTES: Vulnerability Analysis]
-    │        └─ NSE Script Execution
-    │
-    ├── ➔ Phase 4: UDP Enumeration                [PTES: Port Scanning]
-    │        └─ Top 20 Common UDP Ports
-    │
-    └── ➔ Phase 5: Web Directory Fuzzing         [PTES: Web Application Recon]
-             └─ FFUF Fuzzing (Filtered via Dynamic Scheme Detection)
-```
+To reduce the chance of an accidental scan against the wrong host, the script
+enforces two guardrails:
 
-| Pipeline Phase | Method / Tooling | PTES Objective | Output Artifacts |
-| :--- | :--- | :--- | :--- |
-| **Phase 1: Fast TCP Scan** | `nmap -p- --min-rate` | Active Host Discovery | `1_tcp_full.nmap`, `open_ports.txt` |
-| **Phase 2: Service Fingerprinting** | `nmap -sC -sV` | Service Identification & SSL Probing | `2_services.nmap`, `http_ports.txt` |
-| **Phase 3: Vuln Assessment** | `nmap --script vuln` | Automated Vulnerability Identification | `3_vuln.nmap`, `3_vuln.html` |
-| **Phase 4: UDP Discovery** | `nmap -sU --top-ports 20` | Surface Exposure Analysis | `4_udp.nmap` |
-| **Phase 5: Web Fuzzing** | `ffuf` (Context-aware HTTP/S) | Application Pathway Enumeration | `5_web_port_X.json` |
+| Guardrail | What it does |
+|---|---|
+| `--confirm` | **Required on every run.** Without it, the script refuses to start. This is a deliberate "yes, I mean to scan this" gate — it is not a technical control, it's a mistake-catcher. |
+| Scope check | Before scanning, the script checks whether `TARGET` is a private/lab address (RFC1918 `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, loopback, link-local, CGNAT). If the target is a public-looking IP or an unverifiable hostname, the script **refuses to run** unless `--allow-public` is also passed. |
+
+`--allow-public` does **not** mean "I checked and it's fine" — it means
+"I am overriding a safety check I understand." Only use it when you hold a
+signed engagement letter / rules of engagement for that specific target.
+The script cannot verify authorization for you; it can only slow down
+accidental misuse.
 
 ---
 
-## 🛠️ Prerequisites & Installation
+## Requirements
 
-Ensure all dependencies are installed on your Kali Linux or Debian-based system:
+| Tool | Used for | Required? |
+|---|---|---|
+| `nmap` | TCP/UDP port scanning, service detection, `--script vuln` | Yes |
+| `ffuf` | Web content/directory fuzzing | Yes |
+| `xsltproc` | Converting Nmap XML → HTML report | Yes |
+| `awk`, `sed`, `grep` | Output parsing | Yes |
+| `gowitness` | Web screenshotting (preferred) | No — phase skips if missing |
+| `eyewitness` | Web screenshotting (fallback) | No — used only if `gowitness` absent |
+
+On Kali, most of these are preinstalled. Install `gowitness` with:
 
 ```bash
-sudo apt update
-sudo apt install -y nmap ffuf xsltproc gawk coreutils
+go install github.com/sensepost/gowitness@latest
+# or, if packaged:
+sudo apt install gowitness
 ```
+
+If neither screenshot tool is present, the pipeline still runs — Phase 6 is
+skipped with a warning, and the Markdown summary notes it was skipped.
 
 ---
 
-## 💻 Usage & Examples
-
-### Basic Execution
+## Usage
 
 ```bash
-chmod +x recon.sh
-./recon.sh <TARGET_IP>
+./recon.sh --confirm <TARGET_IP> [WORDLIST_PATH]
+./recon.sh --confirm --allow-public <TARGET_HOST_OR_PUBLIC_IP> [WORDLIST_PATH]
+./recon.sh --help
 ```
 
-### Advanced Usage with Custom Parameters
-
-Override scan rates or thread counts on the fly using environment variables:
+**Examples**
 
 ```bash
-TCP_MIN_RATE=2000 FFUF_THREADS=100 ./recon.sh 10.10.10.10 /usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt
+# Standard lab target (private IP, no extra flag needed)
+./recon.sh --confirm 192.168.56.10
+
+# Target with a custom wordlist
+./recon.sh --confirm 192.168.56.10 /usr/share/wordlists/custom.txt
+
+# Public/authorized engagement target — requires explicit override
+./recon.sh --confirm --allow-public client-scope.example.com
+```
+
+Running without `--confirm`, or against a non-private target without
+`--allow-public`, exits with an error before any scanning starts.
+
+### Configuration (environment variables)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TCP_MIN_RATE` | `1000` | Nmap `--min-rate` for the full TCP scan |
+| `UDP_MIN_RATE` | `500` | Nmap `--min-rate` for the UDP scan |
+| `FFUF_THREADS` | `50` | ffuf concurrency |
+| `FFUF_TIMEOUT` | `10` | ffuf per-request timeout (seconds) |
+| `FFUF_MATCH_CODES` | `200,204,301,302,307,401,403` | HTTP status codes ffuf reports |
+| `SCREENSHOT_TIMEOUT` | `15` | Per-URL timeout for gowitness/EyeWitness (seconds) |
+
+Example:
+
+```bash
+TCP_MIN_RATE=300 FFUF_THREADS=20 ./recon.sh --confirm 192.168.56.10
+```
+
+Lower the rates on constrained hardware or slow lab networks to avoid missed
+ports from packet loss.
+
+---
+
+## Pipeline Phases
+
+1. **Full TCP scan** (`nmap -p- --min-rate`) — finds every open TCP port.
+2. **Service/version detection** (`nmap -sC -sV`) — fingerprints what's
+   running on the ports found in Phase 1; also identifies HTTP(S) ports.
+3. **Vulnerability scripts** (`nmap --script vuln`) — flags known-CVE
+   patterns. **Treat hits as leads, not confirmed findings** — NSE vuln
+   scripts have a real false-positive rate.
+4. **UDP scan** (top 20 ports) — UDP is slow to scan fully, so this checks
+   the ports most commonly worth knowing about (DNS, SNMP, NTP, etc.).
+5. **Web content fuzzing** (`ffuf`) — directory/file brute-force against
+   every HTTP(S) port found in Phase 2.
+6. **Web screenshotting** (`gowitness` / `eyewitness`) — visual snapshot of
+   every HTTP(S) service, useful for quickly triaging many hosts/ports.
+7. **Executive summary** — a single `EXECUTIVE_SUMMARY.md` pulling the above
+   into one readable file: open ports, service table, vuln leads, UDP
+   findings, fuzzing hit counts, and a screenshot index.
+
+Each phase degrades gracefully — if a prior phase finds nothing (e.g. no
+open ports, no HTTP services), later phases that depend on it are skipped
+with a warning rather than failing the whole run.
+
+---
+
+## Output Structure
+
+```
+<TARGET>_recon_<TIMESTAMP>/
+├── recon.log                    # full run log (also streamed to stdout)
+├── open_ports.txt
+├── http_ports.txt
+├── 1_tcp_full.{nmap,xml,gnmap,html}
+├── 2_services.{nmap,xml,gnmap,html}
+├── 3_vuln.{nmap,xml,gnmap,html}
+├── 4_udp.{nmap,xml,gnmap,html}
+├── 5_web_port_<port>.json       # one per HTTP(S) port
+├── 6_urls.txt
+├── 6_screenshots/
+│   └── ... (png files + gowitness.sqlite3, if gowitness was used)
+└── EXECUTIVE_SUMMARY.md
 ```
 
 ---
 
-## ⚠️ Operational Limitations & Safety Notice
+## Known Limitations
 
-> **Important Disclaimer for Professional Engagements**
->
-> While this script provides high speed and convenience for competitive labs (HackTheBox, TryHackMe), **it is NOT intended for direct out-of-the-box use on Production Client Engagements** due to:
->
-> 1. **Aggressive Packet Rates (`--min-rate 1000`):** Risks crashing legacy services/OT systems or triggering rate-limits that cause missed ports (False Negatives).
-> 2. **Lack of Scope Enforcement:** Does not contain explicit whitelist/blacklist filtering for strict client Rules of Engagement (RoE).
-> 3. **Single Target Focus:** Designed for individual IP scanning rather than wide CIDR subnet ranges (`/24`).
+Documented deliberately — understanding a tool's blind spots matters as much
+as building it:
+
+- **Single target only.** No CIDR/range support; run in a loop for multiple hosts.
+- **No client-defined scope file.** The private/public IP heuristic is a
+  coarse safety net, not a scope-management system — it can't know about
+  out-of-scope hosts *within* a private range.
+- **Rate settings are static per run**, not adaptive to packet loss —
+  aggressive `--min-rate` values on a lossy network can under-report open ports.
+- **NSE vuln scripts produce false positives.** Findings in
+  `EXECUTIVE_SUMMARY.md` §3 are leads for manual verification, not
+  confirmed vulnerabilities.
+- **No cross-phase correlation** — e.g. a CVE found in Phase 3 and a
+  fuzzing hit on the same port in Phase 5 aren't automatically linked; a
+  human still has to connect them.
+- **No JSON/machine-readable summary export** — output is human-readable
+  Markdown/HTML, not structured for piping into another tool.
 
 ---
 
-## 🛣️ Future Roadmap
+## Disclaimer
 
-- [ ] Integrated Web Screenshotting (via `gowitness` or `aquatone`).
-- [ ] Subnet / CIDR range support with parallel host scanning.
-- [ ] Automated JSON/XML parser to generate a unified Markdown Executive Summary.
-- [ ] Safe-Mode preset (`TCP_MIN_RATE=300`) for sensitive targets.
-
----
-
-## 📜 License
-
-This project is licensed under the **MIT License**. Created for educational purposes and authorized penetration testing in lab environments only.
+For use only against systems you own or are explicitly authorized in writing
+to test. The author is not responsible for misuse. This project was built
+as a learning exercise for penetration testing methodology and Bash scripting.
