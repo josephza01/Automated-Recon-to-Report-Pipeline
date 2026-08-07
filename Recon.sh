@@ -27,9 +27,46 @@ YELLOW=$'\033[1;33m'
 CYAN=$'\033[0;36m'
 NC=$'\033[0m'
 
+# ==========================================
+# ARGUMENT PARSING (supports flags anywhere)
+# ==========================================
+CONFIRM=0
+ALLOW_PUBLIC=0
+POSITIONAL=()
+
+print_usage() {
+    cat <<EOF
+Usage: $0 --confirm [--allow-public] <TARGET_IP> [WORDLIST_PATH]
+
+Required:
+  --confirm         Explicitly confirm you are authorized to test TARGET.
+                     The script refuses to run without this flag.
+
+Optional:
+  --allow-public     Allow scanning a target OUTSIDE private/RFC1918 lab
+                     ranges (or a hostname that can't be scope-verified).
+                     Only use this with EXPLICIT WRITTEN AUTHORIZATION
+                     (e.g. a signed pentest engagement / rules of engagement).
+  -h, --help         Show this help message.
+
+Examples:
+  $0 --confirm 192.168.56.10
+  $0 --confirm --allow-public client-scope.example.com wordlist.txt
+EOF
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        --confirm)      CONFIRM=1 ;;
+        --allow-public) ALLOW_PUBLIC=1 ;;
+        -h|--help)      print_usage; exit 0 ;;
+        *)              POSITIONAL+=("$arg") ;;
+    esac
+done
+
 # Target & Wordlist Arguments
-TARGET="${1:-}"
-WORDLIST="${2:-${WORDLIST:-$DEFAULT_WORDLIST}}"
+TARGET="${POSITIONAL[0]:-}"
+WORDLIST="${POSITIONAL[1]:-${WORDLIST:-$DEFAULT_WORDLIST}}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 # ==========================================
@@ -42,7 +79,7 @@ cleanup() {
     exit 130
 }
 
-# Trap Signal  (Ctrl+C หรือ kill command)
+# ดักจับ Signal การยกเลิก (Ctrl+C หรือ kill command)
 trap cleanup SIGINT SIGTERM
 
 # ==========================================
@@ -55,9 +92,11 @@ err()  { echo -e "${RED}[-] $*${NC}"; }
 banner() {
     echo -e "${CYAN}"
     echo "=============================================="
-    echo "  RECON TARGET : $TARGET"
-    echo "  TIMESTAMP    : $TIMESTAMP"
-    echo "  OUTPUT DIR   : ${OUTDIR:-N/A}"
+    echo "  RECON TARGET   : $TARGET"
+    echo "  TIMESTAMP      : $TIMESTAMP"
+    echo "  OUTPUT DIR     : ${OUTDIR:-N/A}"
+    echo "  AUTHORIZED     : $([[ $CONFIRM -eq 1 ]] && echo 'YES (--confirm)' || echo 'NO')"
+    echo "  ALLOW-PUBLIC   : $([[ $ALLOW_PUBLIC -eq 1 ]] && echo 'YES' || echo 'NO (lab-scope only)')"
     echo "=============================================="
     echo -e "${NC}"
 }
@@ -133,14 +172,74 @@ is_https_port() {
 }
 
 # ==========================================
+# AUTHORIZATION & SCOPE GUARDRAILS
+# ==========================================
+# ตรวจสอบว่า target อยู่ใน private/lab range หรือไม่ (RFC1918 + loopback + link-local + CGN)
+# Return: 0 = private/lab range, 1 = public-looking IP, 2 = not a valid IPv4 (likely hostname)
+is_private_ip() {
+    local ip="$1"
+    if [[ ! "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        return 2
+    fi
+    local o1="${BASH_REMATCH[1]}" o2="${BASH_REMATCH[2]}"
+    (( o1 == 10 )) && return 0                              # 10.0.0.0/8
+    (( o1 == 172 && o2 >= 16 && o2 <= 31 )) && return 0      # 172.16.0.0/12
+    (( o1 == 192 && o2 == 168 )) && return 0                 # 192.168.0.0/16
+    (( o1 == 127 )) && return 0                               # 127.0.0.0/8 loopback
+    (( o1 == 169 && o2 == 254 )) && return 0                 # 169.254.0.0/16 link-local
+    (( o1 == 100 && o2 >= 64 && o2 <= 127 )) && return 0     # 100.64.0.0/10 CGN
+    return 1
+}
+
+scope_check() {
+    is_private_ip "$TARGET"
+    local rc=$?
+
+    if (( rc == 0 )); then
+        log "Scope check: '$TARGET' is within a private/lab IP range (RFC1918/loopback/link-local/CGN)."
+        return
+    fi
+
+    if (( rc == 2 )); then
+        warn "Scope check: '$TARGET' is not a plain IPv4 address (looks like a hostname)."
+        warn "Cannot automatically verify this target is in-scope."
+    else
+        warn "Scope check: '$TARGET' looks like a PUBLIC IP address (outside RFC1918 lab ranges)."
+    fi
+
+    if (( ALLOW_PUBLIC == 0 )); then
+        err "Refusing to proceed. This target could not be auto-verified as a private/lab address."
+        err "If you have EXPLICIT WRITTEN AUTHORIZATION to test this target, re-run with --allow-public."
+        exit 1
+    else
+        warn "Proceeding because --allow-public was specified."
+        warn "YOU are responsible for confirming written authorization / rules of engagement for '$TARGET'."
+    fi
+}
+
+authorization_gate() {
+    if (( CONFIRM == 0 )); then
+        err "Refusing to run: missing required --confirm flag."
+        err "--confirm asserts that you are authorized to run active scans against '$TARGET'."
+        echo ""
+        print_usage
+        exit 1
+    fi
+    log "Authorization confirmed via --confirm for target: $TARGET"
+}
+
+# ==========================================
 # INITIALIZATION & PIPELINE PHASES
 # ==========================================
 
 if [[ -z "$TARGET" ]]; then
-    err "Usage: $0 <TARGET_IP> [WORDLIST_PATH]"
+    err "Usage: $0 --confirm [--allow-public] <TARGET_IP> [WORDLIST_PATH]"
+    err "Run '$0 --help' for details."
     exit 1
 fi
 
+authorization_gate
+scope_check
 check_deps
 
 OUTDIR="${TARGET}_recon_${TIMESTAMP}"
@@ -299,7 +398,7 @@ phase6_screenshot() {
                 --timeout "$SCREENSHOT_TIMEOUT" 2>/dev/null; then
             log "OK: gowitness screenshots saved to $shot_dir"
         else
-            # Fallback flags  gowitness v2 for differnt syntax 
+            # Fallback flags สำหรับ gowitness v2 ที่ syntax ต่างกัน
             warn "gowitness v3 syntax failed, retrying with legacy (v2) syntax..."
             run_cmd "gowitness (legacy syntax)" \
                 gowitness file -f "$url_list" -P "$shot_dir" --timeout "$SCREENSHOT_TIMEOUT"
@@ -318,6 +417,8 @@ phase6_screenshot() {
 # ==========================================
 # EXECUTIVE SUMMARY (MARKDOWN REPORT)
 # ==========================================
+# รวบรวมผลจากทุก Phase มาสรุปเป็นไฟล์ Markdown อ่านง่าย
+# เหมาะสำหรับแนบไปกับรายงาน หรือ paste ลง Obsidian/Notion
 generate_markdown_report() {
     log "Generating Executive Summary (Markdown)"
 
@@ -336,6 +437,8 @@ generate_markdown_report() {
         echo "| Target | \`$TARGET\` |"
         echo "| Scan Date | $TIMESTAMP |"
         echo "| Output Directory | \`$OUTDIR\` |"
+        echo "| Authorized (--confirm) | $([[ $CONFIRM -eq 1 ]] && echo 'Yes' || echo 'No') |"
+        echo "| Allow-Public Scope | $([[ $ALLOW_PUBLIC -eq 1 ]] && echo 'Yes' || echo 'No (lab-range only)') |"
         echo ""
         echo "---"
         echo ""
@@ -358,6 +461,7 @@ generate_markdown_report() {
         if [[ -f "$OUTDIR/2_services.nmap" ]]; then
             echo "| Port/Proto | State | Service | Version |"
             echo "|---|---|---|---|"
+            # แปลงบรรทัดแบบ "22/tcp   open  ssh   OpenSSH 8.4"
             grep -E '^[0-9]+/(tcp|udp)' "$OUTDIR/2_services.nmap" | \
             awk '{
                 port=$1; state=$2; svc=$3;
@@ -378,7 +482,7 @@ generate_markdown_report() {
             local vuln_hits
             vuln_hits=$(grep -iE 'VULNERABLE|CVE-[0-9]{4}-[0-9]+' "$OUTDIR/3_vuln.nmap" || true)
             if [[ -n "$vuln_hits" ]]; then
-                echo "> Potential findings below — **verify manually**, nmap NSE vuln scripts can false-positive."
+                echo "> ⚠️ Potential findings below — **verify manually**, nmap NSE vuln scripts can false-positive."
                 echo ""
                 echo "\`\`\`"
                 echo "$vuln_hits"
